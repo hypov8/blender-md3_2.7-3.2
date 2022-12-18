@@ -11,7 +11,16 @@ import bpy
 import mathutils
 
 from . import fmt_md3 as fmt
-from .utils import OffsetBytesIO
+from .utils import (
+    OffsetBytesIO,
+    # hy: backward compatable
+    set_select_state,
+    get_coll_group,
+    get_uv_data,
+    get_objects,
+    get_hide,
+    get_empty_draw_type
+)
 
 nums = re.compile(r'\.\d{3}$')
 
@@ -29,8 +38,8 @@ def gather_shader_info(mesh, texture_dir):
         nodes = material.node_tree.nodes
         for node in nodes:
             if (
-                'Base Color' not in node.inputs
-                or len(node.inputs['Base Color'].links) <= 0
+                'Base Color' not in node.inputs or
+                len(node.inputs['Base Color'].links) <= 0
             ):
                 continue
 
@@ -41,7 +50,7 @@ def gather_shader_info(mesh, texture_dir):
             if (uv_map_name not in uv_maps):
                 uv_maps[uv_map_name] = []
             uv_maps[uv_map_name].append(texture_dir + prepare_name(link_node.image.name))
-    
+
     uv_maps = [(k, v) for k, v in uv_maps.items()]
     if len(uv_maps) <= 0:
         print('Warning: No UV maps found, zero filling will be used')
@@ -60,6 +69,26 @@ def gather_vertex_info(mesh):
         vertex_to_loop[loop.vertex_index] = loop.index
 
     return vertex_to_loop
+
+
+def gather_vertices_279(mesh, uvmap_data=None):
+    md3vert_to_loop_map = []
+    loop_to_md3vert_map = []
+    index = {}
+    for i, loop in enumerate(mesh.loops):
+        key = (
+            loop.vertex_index,
+            tuple(loop.normal),
+            None if uvmap_data is None else tuple(uvmap_data[i].uv),
+        )
+        md3id = index.get(key, None)
+        if md3id is None:
+            md3id = len(md3vert_to_loop_map)
+            index[key] = md3id
+            md3vert_to_loop_map.append(i)
+        loop_to_md3vert_map.append(md3id)
+
+    return md3vert_to_loop_map, loop_to_md3vert_map
 
 
 def interp(a, b, t):
@@ -82,8 +111,8 @@ def find_interval(vs, t):
     return a, b
 
 
-class MD3Exporter:
-    def __init__(self, context, texture_dir = ""):
+class MD3Exporter_KP:
+    def __init__(self, context, texture_dir=""):
         self.context = context
         self.texture_dir = texture_dir
         if len(self.texture_dir) > 0 and not self.texture_dir.endswith("/"):
@@ -117,7 +146,12 @@ class MD3Exporter:
         )
 
     def pack_surface_triangle(self, i):
-        a, b, c = (self.mesh.loops[j].vertex_index for j in self.mesh.loop_triangles[i].loops)
+        if self.b_old_ver:  # bpy.app.version < (2, 80, 0):
+            assert self.mesh.polygons[i].loop_total == 3
+            start = self.mesh.polygons[i].loop_start
+            a, b, c = (self.mesh_loop_to_md3vert[j] for j in range(start, start + 3))
+        else:
+            a, b, c = (self.mesh.loops[j].vertex_index for j in self.mesh.loop_triangles[i].loops)
         return fmt.Triangle.pack(a, c, b)  # swapped c/b
 
     def get_evaluated_vertex_co(self, frame, i):
@@ -131,8 +165,10 @@ class MD3Exporter:
             kbs = self.mesh.shape_keys.key_blocks
             a, b, t = self.mesh_sk_abs
             co = interp(kbs[a].data[i].co, kbs[b].data[i].co, t)
-
-        co = self.mesh_matrix @ co
+        if self.b_old_ver:  # bpy.app.version < (2, 80, 0):
+            co = self.mesh_matrix * co
+        else:
+            co = self.mesh_matrix @ co
         self.mesh_vco[frame].append(co)
         return co
 
@@ -155,12 +191,21 @@ class MD3Exporter:
     def surface_start_frame(self, i):
         self.switch_frame(i)
 
-        obj = bpy.context.view_layer.objects.active
-        self.mesh_matrix = obj.matrix_world
-        self.mesh = obj.to_mesh(preserve_all_data_layers=True)
-        self.mesh.split_faces()
-        self.mesh.calc_normals()
-        self.mesh.calc_loop_triangles()
+        if self.b_old_ver:  # bpy.app.version < (2, 80, 0):
+            # obj = bpy.context.scene.objects.active  # self.scene.objects.active
+            obj = self.active_obj
+            self.mesh_matrix = obj.matrix_world
+            self.mesh = obj.to_mesh(self.scene, True, 'PREVIEW')
+            self.mesh.calc_normals_split()
+        else:
+            # obj = bpy.context.scene.objects.active
+            # bpy.context.view_layer.objects.active
+            obj = self.active_obj
+            self.mesh_matrix = obj.matrix_world
+            self.mesh = obj.to_mesh(preserve_all_data_layers=True)
+            self.mesh.split_faces()
+            self.mesh.calc_normals()
+            self.mesh.calc_loop_triangles()
 
         self.mesh_sk_rel = None
         self.mesh_sk_abs = None
@@ -182,18 +227,38 @@ class MD3Exporter:
 
     def pack_surface(self, surf_name):
         obj = self.scene.objects[surf_name]
-        bpy.context.view_layer.objects.active = obj
-        self.mesh = obj.to_mesh(preserve_all_data_layers=True)
-        self.mesh.split_faces()
-        self.mesh.calc_normals()
-        self.mesh.calc_loop_triangles()
+        if self.b_old_ver:  # bpy.app.version < (2, 80, 0):
+            # self.scene.objects.active = obj
+            # bpy.context.scene.objects.active = obj
+            # bpy.ops.object.modifier_add(type='TRIANGULATE')  # no 4-gons or n-gons
+            self.active_obj = obj
+            self.mesh = obj.to_mesh(self.scene, True, 'PREVIEW')
+            self.mesh.calc_normals_split()
 
-        self.mesh_uvmap_name, self.mesh_shader_list = gather_shader_info(self.mesh, self.texture_dir)
-        self.mesh_vertex_to_loop = gather_vertex_info(self.mesh)
+            self.mesh_uvmap_name, self.mesh_shader_list = gather_shader_info(self.mesh, self.texture_dir)
+            self.mesh_md3vert_to_loop, self.mesh_loop_to_md3vert = gather_vertices_279(
+                self.mesh,
+                None if self.mesh_uvmap_name is None else self.mesh.uv_layers[self.mesh_uvmap_name].data)
 
-        nShaders = len(self.mesh_shader_list)
-        nVerts = len(self.mesh.vertices)
-        nTris = len(self.mesh.loop_triangles)
+            nShaders = len(self.mesh_shader_list)
+            nVerts = len(self.mesh_md3vert_to_loop)
+            nTris = len(self.mesh.polygons)
+        else:
+            # obj.select_set(state=True)
+            # bpy.context.view_layer.objects.active =
+            self.active_obj = obj
+            # bpy.context.scene.objects.active = obj
+            self.mesh = obj.to_mesh(preserve_all_data_layers=True)
+            self.mesh.split_faces()
+            self.mesh.calc_normals()
+            self.mesh.calc_loop_triangles()
+
+            self.mesh_uvmap_name, self.mesh_shader_list = gather_shader_info(self.mesh, self.texture_dir)
+            self.mesh_vertex_to_loop = gather_vertex_info(self.mesh)
+
+            nShaders = len(self.mesh_shader_list)
+            nVerts = len(self.mesh.vertices)
+            nTris = len(self.mesh.loop_triangles)
 
         self.scene.frame_set(self.scene.frame_start)
 
@@ -211,6 +276,9 @@ class MD3Exporter:
             f.write(b''.join([self.pack_surface_vert(frame, i) for i in range(nVerts)]))
 
         f.mark('offEnd')
+
+        # release here, to_mesh used for every frame
+        # bpy.ops.object.modifier_remove(modifier=obj.modifiers[-1].name)  # B2.7
 
         print('- - - -')
         print('Surface {}: nVerts={}{} nTris={}{} nShaders={}{}'.format(
@@ -270,12 +338,13 @@ class MD3Exporter:
         self.nFrames = self.scene.frame_end - self.scene.frame_start + 1
         self.surfNames = []
         self.tagNames = []
+        self.b_old_ver = True if bpy.app.version < (2, 80, 0) else False
         for o in self.scene.objects:
-            if o.hide_viewport:  # skip hidden objects
+            if get_hide(o):  # .hide_viewport:  # skip hidden objects
                 continue
             if o.type == 'MESH':
                 self.surfNames.append(o.name)
-            elif o.type == 'EMPTY' and o.empty_draw_type == 'ARROWS':
+            elif o.type == 'EMPTY' and get_empty_draw_type(o) == 'ARROWS':  # hy: is draw_type really needed?
                 self.tagNames.append(o.name)
         self.mesh_vco = defaultdict(list)
 
