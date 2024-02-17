@@ -26,3 +26,5 @@ v0.4.4.1
 ### todo:
 - exporter. make backward compatable
 - read .skin file
+- fix wobble
+- rigged models not animating. 
